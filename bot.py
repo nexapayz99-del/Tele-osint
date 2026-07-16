@@ -1,15 +1,12 @@
-cd ~/Tele-osint
+# Remove old bot.py
+rm bot.py
 
-# Backup existing bot.py if it exists
-mv bot.py bot.py.backup 2>/dev/null
-
-# Create the new bot.py
+# Create new bot.py
 cat > bot.py << 'EOF'
 #!/usr/bin/env python3
 """
 Telegram OSINT Bot - Search user information via API
 """
-import asyncio
 import logging
 import os
 import sys
@@ -579,6 +576,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     text = update.message.text.strip()
+    # If user sends a number, treat it as a search
     if text.isdigit() and len(text) >= 5:
         await perform_search(update, context, text)
 
