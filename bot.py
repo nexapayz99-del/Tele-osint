@@ -37,7 +37,7 @@ app = Client(
 )
 
 # Placeholder for your target API endpoint (Replace on your local server)
-API_ENDPOINT = "https://api.example.com/lookup?num={}"
+API_ENDPOINT = "http://techspy.site.je/api/index.php?api_id=api_812154f4&num={}"
 
 
 # --- BOT HANDLERS ---
