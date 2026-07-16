@@ -1,7 +1,13 @@
+# Backup old bot
+mv bot.py bot.py.bak
+
+# Create new bot.py
+cat > bot.py << 'EOF'
 import requests
 import logging
 import json
 import os
+import sys
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -25,9 +31,11 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/')
 DATABASE_NAME = os.getenv('DATABASE_NAME', 'telegram_bot_db')
-OWNER_ID = int(os.getenv('OWNER_ID', '0'))
+OWNER_ID = int(os.getenv('OWNER_ID', '0')) if os.getenv('OWNER_ID') else 0
 ADMIN_IDS = [int(id.strip()) for id in os.getenv('ADMIN_IDS', '').split(',') if id.strip()]
-if OWNER_ID not in ADMIN_IDS and OWNER_ID != 0:
+
+# Ensure owner is in admin list
+if OWNER_ID and OWNER_ID not in ADMIN_IDS:
     ADMIN_IDS.append(OWNER_ID)
 
 API_URL = 'http://techspy.site.je/api/index.php'
@@ -51,13 +59,17 @@ try:
 except Exception as e:
     logger.error(f"MongoDB connection error: {e}")
     db = None
+    users_collection = None
+    search_history = None
+    banned_users = None
+    logs = None
 
 # Conversation states
 SEARCH_QUERY = 1
 
 # Database functions
 def add_user(user_id, username=None, first_name=None, last_name=None):
-    if db is None:
+    if db is None or users_collection is None:
         return False
     try:
         user_data = {
@@ -81,12 +93,15 @@ def add_user(user_id, username=None, first_name=None, last_name=None):
         return False
 
 def is_user_banned(user_id):
-    if db is None:
+    if db is None or banned_users is None:
         return False
-    return banned_users.find_one({'user_id': user_id}) is not None
+    try:
+        return banned_users.find_one({'user_id': user_id}) is not None
+    except Exception:
+        return False
 
 def ban_user(user_id, reason=None, admin_id=None):
-    if db is None:
+    if db is None or banned_users is None:
         return False
     try:
         ban_data = {
@@ -110,7 +125,7 @@ def ban_user(user_id, reason=None, admin_id=None):
         return False
 
 def unban_user(user_id):
-    if db is None:
+    if db is None or banned_users is None:
         return False
     try:
         banned_users.delete_one({'user_id': user_id})
@@ -124,12 +139,15 @@ def unban_user(user_id):
         return False
 
 def get_banned_users(limit=100):
-    if db is None:
+    if db is None or banned_users is None:
         return []
-    return list(banned_users.find().limit(limit))
+    try:
+        return list(banned_users.find().limit(limit))
+    except Exception:
+        return []
 
 def add_search(user_id, search_query, result_data=None):
-    if db is None:
+    if db is None or search_history is None:
         return False
     try:
         search_data = {
@@ -149,16 +167,22 @@ def add_search(user_id, search_query, result_data=None):
         return False
 
 def get_user_history(user_id, limit=10):
-    if db is None:
+    if db is None or search_history is None:
         return []
-    return list(search_history.find(
-        {'user_id': user_id}
-    ).sort('timestamp', -1).limit(limit))
+    try:
+        return list(search_history.find(
+            {'user_id': user_id}
+        ).sort('timestamp', -1).limit(limit))
+    except Exception:
+        return []
 
 def get_user(user_id):
-    if db is None:
+    if db is None or users_collection is None:
         return None
-    return users_collection.find_one({'user_id': user_id})
+    try:
+        return users_collection.find_one({'user_id': user_id})
+    except Exception:
+        return None
 
 def get_stats():
     if db is None:
@@ -181,7 +205,7 @@ def get_stats():
         return {'total_users': 0, 'total_searches': 0, 'banned_users': 0, 'active_today': 0}
 
 def add_log(user_id, action, details=None):
-    if db is None:
+    if db is None or logs is None:
         return False
     try:
         log_data = {
@@ -199,6 +223,7 @@ def add_log(user_id, action, details=None):
 # Bot functions
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    logger.info(f"Start command from user: {user.id}")
     
     if is_user_banned(user.id):
         await update.message.reply_text("🚫 You are banned from using this bot.")
@@ -208,7 +233,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     add_log(user.id, "start", "User started the bot")
     
     welcome_text = f"""
-👋 **Welcome {user.first_name}!**
+👋 **Welcome {user.first_name or 'User'}!**
 
 I'm a user information lookup bot. Use me to find information about users.
 
@@ -226,6 +251,7 @@ Example: `/search 123456789`
 Made with ❤️
 """
     await update.message.reply_text(welcome_text, parse_mode='Markdown')
+    logger.info(f"Welcome message sent to {user.id}")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -292,10 +318,14 @@ async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, use
     
     try:
         api_url = f"{API_URL}?api_id={API_ID}&num={user_id}"
+        logger.info(f"Calling API: {api_url}")
         response = requests.get(api_url, timeout=30)
         
         if response.status_code == 200:
-            data = response.json()
+            try:
+                data = response.json()
+            except:
+                data = response.text
             
             result_text = f"""
 🎯 **User Information**
@@ -338,6 +368,10 @@ async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, use
         else:
             await msg.edit_text(f"❌ API Error (Status: {response.status_code})\nPlease try again later.")
             
+    except requests.exceptions.Timeout:
+        await msg.edit_text("⏰ Request timed out. Please try again later.")
+    except requests.exceptions.ConnectionError:
+        await msg.edit_text("🔌 Connection error. Please try again later.")
     except Exception as e:
         logger.error(f"Search error: {e}")
         await msg.edit_text("❌ An unexpected error occurred. Please try again.")
@@ -389,7 +423,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     
-    if user.id not in ADMIN_IDS and user.id != OWNER_ID:
+    if user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ You are not authorized to use this command.")
         return
     
@@ -418,7 +452,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     
-    if user.id not in ADMIN_IDS and user.id != OWNER_ID:
+    if user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ You are not authorized to use this command.")
         return
     
@@ -444,7 +478,7 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     
-    if user.id not in ADMIN_IDS and user.id != OWNER_ID:
+    if user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ You are not authorized to use this command.")
         return
     
@@ -469,7 +503,7 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def banned_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     
-    if user.id not in ADMIN_IDS and user.id != OWNER_ID:
+    if user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ You are not authorized to use this command.")
         return
     
@@ -488,7 +522,7 @@ async def banned_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     
-    if user.id not in ADMIN_IDS and user.id != OWNER_ID:
+    if user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ You are not authorized to use this command.")
         return
     
@@ -502,7 +536,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text("📢 Sending broadcast message...")
     
-    all_users = users_collection.find({})
+    all_users = users_collection.find({}) if users_collection else []
     
     for user_data in all_users:
         try:
@@ -561,6 +595,7 @@ def main():
         logger.error("Database connection failed. Please check MongoDB.")
         return
     
+    # Build application with proper parameters
     application = Application.builder().token(BOT_TOKEN).build()
     
     # User commands
@@ -592,6 +627,11 @@ def main():
     application.add_handler(conv_handler)
     
     logger.info("Starting bot...")
+    logger.info(f"Bot token: {BOT_TOKEN[:10]}...")
+    logger.info(f"Admin IDs: {ADMIN_IDS}")
+    logger.info(f"Owner ID: {OWNER_ID}")
+    
+    # Start polling
     application.run_polling()
 
 if __name__ == '__main__':
