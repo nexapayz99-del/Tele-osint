@@ -1,6 +1,7 @@
+import asyncio
+asyncio.set_event_loop(asyncio.new_event_loop())
 import os
 import logging
-import asyncio
 import aiohttp
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
