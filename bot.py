@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio
 import aiohttp
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -34,8 +35,8 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
-# Placeholder for your target API endpoint
-API_ENDPOINT = "http://techspy.site.je/api/index.php?api_id=api_812154f4&num={}"
+# Placeholder for your target API endpoint (Replace on your local server)
+API_ENDPOINT = "https://api.example.com/lookup?num={}"
 
 
 # --- BOT HANDLERS ---
@@ -95,13 +96,31 @@ async def lookup_number(client: Client, message: Message):
     except Exception as e:
         logger.error(f"Database logging error: {e}")
 
-    # Fetch data from the external API
-    async with aiohttp.ClientSession() as session:
-        try:
+    # --- UPDATED HTTP CLIENT ---
+    
+    # Emulate a real web browser to prevent the remote server from dropping the connection
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    }
+    
+    # Prevent the bot from hanging indefinitely if the API server dies
+    timeout = aiohttp.ClientTimeout(total=15) 
+
+    try:
+        async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
             target_url = API_ENDPOINT.format(phone_number)
             async with session.get(target_url) as response:
+                
                 if response.status == 200:
                     raw_text = await response.text()
+                    
+                    # Prevent empty responses from rendering strangely
+                    if not raw_text.strip():
+                        await status_msg.edit_text("❌ The server responded, but no data was returned.")
+                        return
+                        
                     formatted_response = f"📋 **Search Results for {phone_number}:**\n\n{raw_text}"
                     await status_msg.edit_text(formatted_response)
                     
@@ -111,11 +130,18 @@ async def lookup_number(client: Client, message: Message):
                         {"$set": {"status": "success"}}
                     )
                 else:
-                    await status_msg.edit_text(f"❌ API connection failed. Status: {response.status}")
+                    await status_msg.edit_text(f"❌ API connection failed. Status Code: {response.status}")
                     
-        except Exception as e:
-            logger.error(f"API request error: {e}")
-            await status_msg.edit_text("❌ An error occurred while communicating with the server.")
+    # Granular Error Catching for Network Drops
+    except asyncio.TimeoutError:
+        logger.error("API request timed out.")
+        await status_msg.edit_text("❌ The search timed out. The external API server is unresponsive or overloaded.")
+    except aiohttp.ClientConnectionError as e:
+        logger.error(f"Connection dropped: {e}")
+        await status_msg.edit_text("❌ The remote server actively blocked or dropped the connection. It may be blocking AWS IP addresses.")
+    except Exception as e:
+        logger.error(f"API request error: {e}")
+        await status_msg.edit_text("❌ An unexpected internal error occurred while communicating with the server.")
 
 
 if __name__ == "__main__":
