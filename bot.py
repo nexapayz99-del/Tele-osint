@@ -1,4 +1,3 @@
-cat > bot.py << 'EOF'
 import requests
 import logging
 import json
