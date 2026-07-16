@@ -1,4 +1,11 @@
-python-telegram-bot==20.7
+# Update requirements.txt
+cat > requirements.txt << 'EOF'
+python-telegram-bot==20.3
 pymongo==4.6.1
 requests==2.31.0
 python-dotenv==1.0.0
+EOF
+
+# Reinstall dependencies
+pip uninstall -y python-telegram-bot
+pip install -r requirements.txt
