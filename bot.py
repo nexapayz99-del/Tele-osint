@@ -1,324 +1,186 @@
-# Remove old bot.py
-rm bot.py
-
-# Create new bot.py
-cat > bot.py << 'EOF'
 #!/usr/bin/env python3
 """
-Telegram OSINT Bot - Search user information via API
+Telegram OSINT Bot - Search mobile number information
 """
 import logging
-import os
 import sys
-import json
 import requests
+import re
 from datetime import datetime
-from typing import Optional, Dict, Any
-
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-    ConversationHandler,
-    CallbackQueryHandler,
+    Application, CommandHandler, MessageHandler,
+    filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 )
-from pymongo import MongoClient
-from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+from config import Config
+from database import Database
 
-# Configure logging
+# Setup logging
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
-    handlers=[
-        logging.FileHandler("bot.log"),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
-# Configuration
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
-DATABASE_NAME = os.getenv("DATABASE_NAME", "telegram_bot_db")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-
-if OWNER_ID and OWNER_ID not in ADMIN_IDS:
-    ADMIN_IDS.append(OWNER_ID)
-
-API_URL = "http://techspy.site.je/api/index.php"
-API_ID = "api_812154f4"
-
-# Conversation states
-SEARCH_QUERY = 1
-
-# MongoDB Connection
+# Initialize database
 try:
-    client = MongoClient(MONGODB_URI)
-    db = client[DATABASE_NAME]
-    users_collection = db["users"]
-    searches_collection = db["searches"]
-    banned_collection = db["banned"]
-    logs_collection = db["logs"]
-    
-    # Create indexes
-    users_collection.create_index("user_id", unique=True)
-    banned_collection.create_index("user_id", unique=True)
-    searches_collection.create_index([("user_id", 1), ("timestamp", -1)])
-    
-    logger.info("✅ MongoDB connected successfully")
+    db = Database()
 except Exception as e:
-    logger.error(f"❌ MongoDB connection failed: {e}")
+    logger.error(f"Failed to connect to database: {e}")
     sys.exit(1)
 
-# ==================== DATABASE FUNCTIONS ====================
+# Conversation states
+SEARCH = 1
 
-def register_user(user_id: int, username: str = None, first_name: str = None, last_name: str = None):
-    """Register a new user or update existing"""
-    try:
-        users_collection.update_one(
-            {"user_id": user_id},
-            {
-                "$set": {
-                    "username": username,
-                    "first_name": first_name,
-                    "last_name": last_name,
-                    "last_active": datetime.now(),
-                },
-                "$setOnInsert": {
-                    "joined_date": datetime.now(),
-                    "total_searches": 0,
-                    "is_banned": False,
-                },
-            },
-            upsert=True,
-        )
-        return True
-    except Exception as e:
-        logger.error(f"Error registering user: {e}")
-        return False
+# ============ Helper Functions ============
 
-def is_banned(user_id: int) -> bool:
-    """Check if user is banned"""
-    try:
-        return banned_collection.find_one({"user_id": user_id}) is not None
-    except Exception:
-        return False
+def format_result(number, data):
+    """Format API response for display"""
+    text = f"""
+📱 **Mobile Number OSINT Report**
+━━━━━━━━━━━━━━━━━━━━━
 
-def ban_user(user_id: int, reason: str = None, admin_id: int = None):
-    """Ban a user"""
-    try:
-        banned_collection.update_one(
-            {"user_id": user_id},
-            {
-                "$set": {
-                    "reason": reason or "No reason provided",
-                    "banned_by": admin_id,
-                    "banned_at": datetime.now(),
-                }
-            },
-            upsert=True,
-        )
-        users_collection.update_one(
-            {"user_id": user_id},
-            {"$set": {"is_banned": True}}
-        )
-        return True
-    except Exception as e:
-        logger.error(f"Error banning user: {e}")
-        return False
+🔢 **Number:** `{number}`
 
-def unban_user(user_id: int):
-    """Unban a user"""
-    try:
-        banned_collection.delete_one({"user_id": user_id})
-        users_collection.update_one(
-            {"user_id": user_id},
-            {"$set": {"is_banned": False}}
-        )
-        return True
-    except Exception as e:
-        logger.error(f"Error unbanning user: {e}")
-        return False
+"""
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if value:
+                key_name = key.replace('_', ' ').title()
+                if isinstance(value, str) and len(value) > 100:
+                    value = value[:100] + '...'
+                text += f"**{key_name}:** {value}\n"
+    else:
+        text += f"**Data:** {data}\n"
+    
+    text += f"""
+━━━━━━━━━━━━━━━━━━━━━
+📅 Searched: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+    return text
 
-def get_banned_list(limit: int = 100):
-    """Get list of banned users"""
-    try:
-        return list(banned_collection.find().limit(limit))
-    except Exception:
-        return []
+def validate_number(number):
+    """Validate mobile number"""
+    # Remove any non-digit characters
+    number = re.sub(r'\D', '', number)
+    # Check if it's a valid number (at least 5 digits)
+    if len(number) >= 5 and number.isdigit():
+        return number
+    return None
 
-def save_search(user_id: int, query: str, result: Any):
-    """Save search history"""
-    try:
-        searches_collection.insert_one({
-            "user_id": user_id,
-            "query": query,
-            "result": result,
-            "timestamp": datetime.now(),
-        })
-        users_collection.update_one(
-            {"user_id": user_id},
-            {"$inc": {"total_searches": 1}}
-        )
-        return True
-    except Exception as e:
-        logger.error(f"Error saving search: {e}")
-        return False
-
-def get_search_history(user_id: int, limit: int = 10):
-    """Get user's search history"""
-    try:
-        return list(searches_collection.find(
-            {"user_id": user_id}
-        ).sort("timestamp", -1).limit(limit))
-    except Exception:
-        return []
-
-def get_user_stats(user_id: int):
-    """Get user statistics"""
-    try:
-        return users_collection.find_one({"user_id": user_id})
-    except Exception:
-        return None
-
-def get_bot_stats():
-    """Get bot statistics"""
-    try:
-        return {
-            "total_users": users_collection.count_documents({}),
-            "total_searches": searches_collection.count_documents({}),
-            "banned_users": banned_collection.count_documents({}),
-            "active_today": users_collection.count_documents({
-                "last_active": {
-                    "$gte": datetime.now().replace(hour=0, minute=0, second=0)
-                }
-            }),
-        }
-    except Exception as e:
-        logger.error(f"Error getting stats: {e}")
-        return {"total_users": 0, "total_searches": 0, "banned_users": 0, "active_today": 0}
-
-def log_action(user_id: int, action: str, details: str = None):
-    """Log user action"""
-    try:
-        logs_collection.insert_one({
-            "user_id": user_id,
-            "action": action,
-            "details": details,
-            "timestamp": datetime.now(),
-        })
-    except Exception as e:
-        logger.error(f"Error logging action: {e}")
-
-# ==================== BOT COMMANDS ====================
+# ============ User Commands ============
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command"""
+    """Handle /start"""
     user = update.effective_user
-    logger.info(f"Start command from user: {user.id} ({user.username})")
     
-    if is_banned(user.id):
+    if db.is_banned(user.id):
         await update.message.reply_text("🚫 You are banned from using this bot.")
         return
     
-    register_user(user.id, user.username, user.first_name, user.last_name)
-    log_action(user.id, "start", "User started the bot")
+    db.register_user(user.id, user.username, user.first_name)
+    db.log_action(user.id, 'start')
     
-    welcome_text = f"""
+    welcome = f"""
 👋 **Welcome {user.first_name or 'User'}!**
 
-I'm a user information lookup bot. I can find information about any user ID.
+I'm a mobile number OSINT bot. Send me a number and I'll fetch information.
 
 📌 **Commands:**
-• `/search [user_id]` - Search for user information
-• `/history` - View your search history  
-• `/stats` - View your usage statistics
-• `/help` - Show this help message
+• Send any number - Get OSINT info
+• `/search [number]` - Search a number
+• `/history` - View your search history
+• `/stats` - Your usage statistics
+• `/help` - Show this help
 
-💡 **Example:** `/search 123456789`
+💡 **Example:** `/search 8490889926` or just send `8490889926`
 
 Made with ❤️
 """
-    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+    await update.message.reply_text(welcome, parse_mode='Markdown')
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /help command"""
+    """Handle /help"""
     user = update.effective_user
     
-    if is_banned(user.id):
-        await update.message.reply_text("🚫 You are banned from using this bot.")
+    if db.is_banned(user.id):
+        await update.message.reply_text("🚫 You are banned.")
         return
     
     help_text = """
 📚 **Help Menu**
 
-**Basic Commands:**
-• `/start` - Start the bot
-• `/help` - Show this help menu
-• `/search [user_id]` - Search for user information
-• `/history` - View your search history
-• `/stats` - View your usage statistics
+**How to use:**
+1. Send any mobile number (e.g., 8490889926)
+2. Or use `/search 8490889926`
 
-**How to Search:**
-Type `/search 123456789` (replace with actual user ID)
+**Commands:**
+• `/start` - Start the bot
+• `/help` - Show this menu
+• `/search [number]` - Search a number
+• `/history` - View history
+• `/stats` - Your stats
 
 **Admin Commands:**
-• `/admin` - Open admin panel
-• `/ban [user_id] [reason]` - Ban a user
-• `/unban [user_id]` - Unban a user
-• `/bannedlist` - View banned users
-• `/broadcast [message]` - Send message to all users
+• `/admin` - Admin panel
+• `/ban [user_id] [reason]` - Ban user
+• `/unban [user_id]` - Unban user
+• `/banned` - List banned users
+• `/broadcast [message]` - Send to all
+
+**Support:** Contact @owner
 """
-    await update.message.reply_text(help_text, parse_mode="Markdown")
+    await update.message.reply_text(help_text, parse_mode='Markdown')
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /search command"""
+    """Handle /search"""
     user = update.effective_user
     
-    if is_banned(user.id):
-        await update.message.reply_text("🚫 You are banned from using this bot.")
+    if db.is_banned(user.id):
+        await update.message.reply_text("🚫 You are banned.")
         return
     
     if context.args:
-        user_id = context.args[0]
-        await perform_search(update, context, user_id)
+        number = context.args[0]
+        await perform_search(update, context, number)
     else:
         await update.message.reply_text(
-            "🔍 Please enter the user ID you want to search:\n\n"
-            "Example: `/search 123456789`",
-            parse_mode="Markdown"
+            "🔍 Please enter the mobile number:\n\n"
+            "Example: `/search 8490889926`",
+            parse_mode='Markdown'
         )
-        return SEARCH_QUERY
+        return SEARCH
 
-async def process_search_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Process search input from conversation"""
-    user_id = update.message.text.strip()
-    await perform_search(update, context, user_id)
+async def process_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Process number from conversation"""
+    number = update.message.text.strip()
+    await perform_search(update, context, number)
     return ConversationHandler.END
 
-async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str):
-    """Perform the actual search"""
+async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, number):
+    """Perform the search"""
     user = update.effective_user
     
-    # Validate user ID
-    if not user_id.isdigit():
-        await update.message.reply_text("❌ Invalid user ID. Please enter a valid numeric ID.")
+    # Validate number
+    number = validate_number(number)
+    if not number:
+        await update.message.reply_text(
+            "❌ Invalid number. Please enter a valid mobile number."
+        )
         return
     
     # Send searching message
-    msg = await update.message.reply_text(f"🔍 Searching for user ID: `{user_id}`...", parse_mode="Markdown")
+    msg = await update.message.reply_text(
+        f"🔍 Searching for `{number}`...",
+        parse_mode='Markdown'
+    )
     
     try:
-        # Call the API
-        api_url = f"{API_URL}?api_id={API_ID}&num={user_id}"
-        logger.info(f"Calling API: {api_url}")
+        # Call API
+        api_url = f"{Config.API_URL}?api_id={Config.API_ID}&num={number}"
+        logger.info(f"API Request: {api_url}")
         
         response = requests.get(api_url, timeout=30)
         
@@ -326,51 +188,32 @@ async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, use
             try:
                 data = response.json()
             except:
-                data = {"response": response.text}
+                data = {'response': response.text}
             
-            # Format result
-            result_text = f"""
-🎯 **User Information**
-━━━━━━━━━━━━━━━━━━━━━
-
-📱 **User ID:** `{user_id}`
-
-"""
-            if isinstance(data, dict):
-                for key, value in data.items():
-                    if value:
-                        key_name = key.replace("_", " ").title()
-                        if isinstance(value, str) and len(value) > 100:
-                            value = value[:100] + "..."
-                        result_text += f"**{key_name}:** {value}\n"
-            else:
-                result_text += f"**Data:** {data}\n"
-            
-            result_text += f"""
-━━━━━━━━━━━━━━━━━━━━━
-📅 Searched: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-"""
+            # Format and display result
+            result_text = format_result(number, data)
+            await msg.edit_text(result_text, parse_mode='Markdown')
             
             # Save to database
-            save_search(user.id, user_id, data)
-            log_action(user.id, "search", f"Searched user: {user_id}")
-            
-            await msg.edit_text(result_text, parse_mode="Markdown")
+            db.save_search(user.id, number, data)
+            db.log_action(user.id, 'search', f'Number: {number}')
             
             # Add inline buttons
             keyboard = [
                 [
-                    InlineKeyboardButton("📋 Copy ID", callback_data=f"copy_{user_id}"),
-                    InlineKeyboardButton("🔄 New Search", callback_data="new_search")
+                    InlineKeyboardButton("📋 Copy", callback_data=f"copy_{number}"),
+                    InlineKeyboardButton("🔄 New", callback_data="new_search")
                 ],
-                [InlineKeyboardButton("📊 View History", callback_data="view_history")]
+                [InlineKeyboardButton("📊 History", callback_data="view_history")]
             ]
-            await msg.edit_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+            await msg.edit_reply_markup(
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
             
         elif response.status_code == 404:
-            await msg.edit_text(f"❌ User ID `{user_id}` not found.", parse_mode="Markdown")
+            await msg.edit_text(f"❌ Number `{number}` not found.", parse_mode='Markdown')
         else:
-            await msg.edit_text(f"❌ API Error (Status: {response.status_code})")
+            await msg.edit_text(f"❌ API Error: {response.status_code}")
             
     except requests.exceptions.Timeout:
         await msg.edit_text("⏰ Request timed out. Please try again.")
@@ -378,38 +221,38 @@ async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, use
         await msg.edit_text("🔌 Connection error. Please try again.")
     except Exception as e:
         logger.error(f"Search error: {e}")
-        await msg.edit_text("❌ An unexpected error occurred.")
+        await msg.edit_text("❌ An error occurred. Please try again.")
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /history command"""
+    """Handle /history"""
     user = update.effective_user
     
-    if is_banned(user.id):
-        await update.message.reply_text("🚫 You are banned from using this bot.")
+    if db.is_banned(user.id):
+        await update.message.reply_text("🚫 You are banned.")
         return
     
-    history = get_search_history(user.id, limit=20)
+    history = db.get_history(user.id, 20)
     
     if not history:
-        await update.message.reply_text("📭 You haven't performed any searches yet.")
+        await update.message.reply_text("📭 No search history found.")
         return
     
     text = "📚 **Your Search History**\n━━━━━━━━━━━━━━━━━━━━━\n\n"
-    for i, entry in enumerate(history, 1):
-        timestamp = entry["timestamp"].strftime("%Y-%m-%d %H:%M")
-        text += f"**{i}.** User ID: `{entry['query']}`\n   📅 {timestamp}\n\n"
+    for i, item in enumerate(history, 1):
+        timestamp = item['timestamp'].strftime('%Y-%m-%d %H:%M')
+        text += f"**{i}.** `{item['number']}`\n   📅 {timestamp}\n\n"
     
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text, parse_mode='Markdown')
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /stats command"""
+    """Handle /stats"""
     user = update.effective_user
     
-    if is_banned(user.id):
-        await update.message.reply_text("🚫 You are banned from using this bot.")
+    if db.is_banned(user.id):
+        await update.message.reply_text("🚫 You are banned.")
         return
     
-    user_data = get_user_stats(user.id)
+    user_data = db.users.find_one({'user_id': user.id})
     
     if not user_data:
         await update.message.reply_text("No data found.")
@@ -421,106 +264,109 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 👤 **User:** {user_data.get('first_name', 'Unknown')}
 🆔 **ID:** `{user.id}`
-📅 **Joined:** {user_data.get('joined_date', datetime.now()).strftime('%Y-%m-%d')}
-🔍 **Total Searches:** {user_data.get('total_searches', 0)}
+📅 **Joined:** {user_data.get('joined', datetime.now()).strftime('%Y-%m-%d')}
+🔍 **Searches:** {user_data.get('searches', 0)}
 ⏰ **Last Active:** {user_data.get('last_active', datetime.now()).strftime('%Y-%m-%d %H:%M')}
 """
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text, parse_mode='Markdown')
 
-# ==================== ADMIN COMMANDS ====================
+# ============ Admin Commands ============
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /admin command"""
+    """Handle /admin"""
     user = update.effective_user
     
-    if user.id not in ADMIN_IDS:
+    if user.id not in Config.ADMIN_IDS:
         await update.message.reply_text("⛔ Unauthorized.")
         return
     
-    stats = get_bot_stats()
+    stats = db.get_stats()
     
     text = f"""
 🔐 **Admin Panel**
 ━━━━━━━━━━━━━━━━━━━━━
 
 📊 **Bot Statistics:**
-• **Total Users:** {stats['total_users']}
-• **Total Searches:** {stats['total_searches']}
-• **Banned Users:** {stats['banned_users']}
-• **Active Today:** {stats['active_today']}
+• **Users:** {stats['users']}
+• **Searches:** {stats['searches']}
+• **Banned:** {stats['banned']}
+• **Today:** {stats['today']}
 
-👑 **Owner ID:** `{OWNER_ID}`
+👑 **Owner:** `{Config.OWNER_ID}`
 
-**Admin Commands:**
-• `/ban [user_id] [reason]` - Ban a user
-• `/unban [user_id]` - Unban a user
-• `/bannedlist` - View banned users
-• `/broadcast [message]` - Send message to all users
+**Commands:**
+• `/ban [user_id] [reason]` - Ban
+• `/unban [user_id]` - Unban
+• `/banned` - List banned
+• `/broadcast [msg]` - Broadcast
 """
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text, parse_mode='Markdown')
 
 async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /ban command"""
+    """Handle /ban"""
     user = update.effective_user
     
-    if user.id not in ADMIN_IDS:
+    if user.id not in Config.ADMIN_IDS:
         await update.message.reply_text("⛔ Unauthorized.")
         return
     
     if not context.args:
-        await update.message.reply_text("Usage: `/ban [user_id] [reason]`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: `/ban [user_id] [reason]`", parse_mode='Markdown')
         return
     
     try:
         user_id = int(context.args[0])
-        reason = " ".join(context.args[1:]) if len(context.args) > 1 else "No reason"
+        reason = ' '.join(context.args[1:]) or 'No reason'
         
-        if is_banned(user_id):
-            await update.message.reply_text(f"ℹ️ User `{user_id}` is already banned.", parse_mode="Markdown")
+        if db.is_banned(user_id):
+            await update.message.reply_text(f"ℹ️ User `{user_id}` already banned.", parse_mode='Markdown')
             return
         
-        ban_user(user_id, reason, user.id)
-        log_action(user.id, "ban", f"Banned: {user_id}, Reason: {reason}")
+        db.ban_user(user_id, reason, user.id)
+        db.log_action(user.id, 'ban', f'User: {user_id}, Reason: {reason}')
         
-        await update.message.reply_text(f"✅ User `{user_id}` banned.\n**Reason:** {reason}", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"✅ User `{user_id}` banned.\n**Reason:** {reason}",
+            parse_mode='Markdown'
+        )
     except ValueError:
         await update.message.reply_text("❌ Invalid user ID.")
 
 async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /unban command"""
+    """Handle /unban"""
     user = update.effective_user
     
-    if user.id not in ADMIN_IDS:
+    if user.id not in Config.ADMIN_IDS:
         await update.message.reply_text("⛔ Unauthorized.")
         return
     
     if not context.args:
-        await update.message.reply_text("Usage: `/unban [user_id]`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: `/unban [user_id]`", parse_mode='Markdown')
         return
     
     try:
         user_id = int(context.args[0])
         
-        if not is_banned(user_id):
-            await update.message.reply_text(f"ℹ️ User `{user_id}` is not banned.", parse_mode="Markdown")
+        if not db.is_banned(user_id):
+            await update.message.reply_text(f"ℹ️ User `{user_id}` not banned.", parse_mode='Markdown')
             return
         
-        unban_user(user_id)
-        log_action(user.id, "unban", f"Unbanned: {user_id}")
+        db.unban_user(user_id)
+        db.log_action(user.id, 'unban', f'User: {user_id}')
         
-        await update.message.reply_text(f"✅ User `{user_id}` unbanned.", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ User `{user_id}` unbanned.", parse_mode='Markdown')
     except ValueError:
         await update.message.reply_text("❌ Invalid user ID.")
 
-async def banned_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /bannedlist command"""
+async def banned_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /banned"""
     user = update.effective_user
     
-    if user.id not in ADMIN_IDS:
+    if user.id not in Config.ADMIN_IDS:
         await update.message.reply_text("⛔ Unauthorized.")
         return
     
-    banned = get_banned_list()
+    banned = db.get_banned()
     
     if not banned:
         await update.message.reply_text("✅ No banned users.")
@@ -528,71 +374,76 @@ async def banned_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     text = "🚫 **Banned Users**\n━━━━━━━━━━━━━━━━━━━━━\n\n"
     for i, b in enumerate(banned, 1):
-        text += f"**{i}.** User: `{b['user_id']}`\n   Reason: {b.get('reason', 'N/A')}\n   At: {b['banned_at'].strftime('%Y-%m-%d %H:%M')}\n\n"
+        text += f"**{i}.** User: `{b['user_id']}`\n"
+        text += f"   Reason: {b.get('reason', 'N/A')}\n"
+        text += f"   At: {b['banned_at'].strftime('%Y-%m-%d %H:%M')}\n\n"
     
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text, parse_mode='Markdown')
 
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /broadcast command"""
+    """Handle /broadcast"""
     user = update.effective_user
     
-    if user.id not in ADMIN_IDS:
+    if user.id not in Config.ADMIN_IDS:
         await update.message.reply_text("⛔ Unauthorized.")
         return
     
     if not context.args:
-        await update.message.reply_text("Usage: `/broadcast [message]`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: `/broadcast [message]`", parse_mode='Markdown')
         return
     
-    message = " ".join(context.args)
+    message = ' '.join(context.args)
     sent = 0
     failed = 0
     
     await update.message.reply_text("📢 Sending broadcast...")
     
-    for user_data in users_collection.find({}):
+    for user_data in db.users.find({}):
         try:
-            if not user_data.get("is_banned", False):
+            if not user_data.get('banned', False):
                 await context.bot.send_message(
-                    chat_id=user_data["user_id"],
+                    chat_id=user_data['user_id'],
                     text=f"📢 **Broadcast**\n\n{message}",
-                    parse_mode="Markdown"
+                    parse_mode='Markdown'
                 )
                 sent += 1
         except Exception as e:
             logger.error(f"Broadcast failed to {user_data['user_id']}: {e}")
             failed += 1
     
-    await update.message.reply_text(f"✅ Broadcast sent!\n**Sent:** {sent}\n**Failed:** {failed}")
+    await update.message.reply_text(
+        f"✅ Broadcast sent!\n**Sent:** {sent}\n**Failed:** {failed}"
+    )
 
-# ==================== MESSAGE HANDLERS ====================
+# ============ Message Handlers ============
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle non-command messages"""
+    """Handle normal messages"""
     user = update.effective_user
     
-    if is_banned(user.id):
-        await update.message.reply_text("🚫 You are banned from using this bot.")
+    if db.is_banned(user.id):
+        await update.message.reply_text("🚫 You are banned.")
         return
     
     text = update.message.text.strip()
-    # If user sends a number, treat it as a search
+    
+    # If message is a number, search it
     if text.isdigit() and len(text) >= 5:
         await perform_search(update, context, text)
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline button callbacks"""
+    """Handle inline buttons"""
     query = update.callback_query
     await query.answer()
     
     data = query.data
     
-    if data.startswith("copy_"):
-        user_id = data.split("_")[1]
-        await query.message.reply_text(f"📋 User ID: `{user_id}`", parse_mode="Markdown")
-    elif data == "new_search":
-        await query.message.reply_text("🔍 Enter user ID:")
-    elif data == "view_history":
+    if data.startswith('copy_'):
+        number = data.split('_')[1]
+        await query.message.reply_text(f"📋 Number: `{number}`", parse_mode='Markdown')
+    elif data == 'new_search':
+        await query.message.reply_text("🔍 Send me a mobile number:")
+    elif data == 'view_history':
         await history_command(update, context)
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -600,53 +451,50 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Cancelled.")
     return ConversationHandler.END
 
-# ==================== MAIN ====================
+# ============ Main ============
 
 def main():
     """Start the bot"""
-    if not BOT_TOKEN:
+    if not Config.BOT_TOKEN:
         logger.error("❌ BOT_TOKEN not set in .env")
         sys.exit(1)
     
-    if not MONGODB_URI:
-        logger.error("❌ MONGODB_URI not set in .env")
-        sys.exit(1)
-    
-    logger.info("🚀 Starting Telegram OSINT Bot...")
-    logger.info(f"👑 Owner ID: {OWNER_ID}")
-    logger.info(f"👥 Admin IDs: {ADMIN_IDS}")
-    logger.info(f"📡 API URL: {API_URL}")
+    logger.info("🚀 Starting OSINT Bot...")
+    logger.info(f"👑 Owner: {Config.OWNER_ID}")
+    logger.info(f"📡 API: {Config.API_URL}")
     
     # Create application
-    application = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(Config.BOT_TOKEN).build()
     
     # Add handlers
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("search", search_command))
-    application.add_handler(CommandHandler("history", history_command))
-    application.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler('start', start_command))
+    app.add_handler(CommandHandler('help', help_command))
+    app.add_handler(CommandHandler('search', search_command))
+    app.add_handler(CommandHandler('history', history_command))
+    app.add_handler(CommandHandler('stats', stats_command))
     
-    application.add_handler(CommandHandler("admin", admin_panel))
-    application.add_handler(CommandHandler("ban", ban_command))
-    application.add_handler(CommandHandler("unban", unban_command))
-    application.add_handler(CommandHandler("bannedlist", banned_list_command))
-    application.add_handler(CommandHandler("broadcast", broadcast_command))
+    # Admin handlers
+    app.add_handler(CommandHandler('admin', admin_panel))
+    app.add_handler(CommandHandler('ban', ban_command))
+    app.add_handler(CommandHandler('unban', unban_command))
+    app.add_handler(CommandHandler('banned', banned_list))
+    app.add_handler(CommandHandler('broadcast', broadcast_command))
     
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(CallbackQueryHandler(button_callback))
+    # Message handlers
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(button_callback))
     
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("search", search_command)],
-        states={SEARCH_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_search_input)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
+    # Conversation handler
+    conv = ConversationHandler(
+        entry_points=[CommandHandler('search', search_command)],
+        states={SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_number)]},
+        fallbacks=[CommandHandler('cancel', cancel)]
     )
-    application.add_handler(conv_handler)
+    app.add_handler(conv)
     
-    # Start bot
-    logger.info("✅ Bot is running! Press Ctrl+C to stop.")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Start
+    logger.info("✅ Bot is running!")
+    app.run_polling()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
-EOF
