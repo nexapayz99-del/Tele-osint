@@ -1,7 +1,3 @@
-# First, navigate to the correct directory
-cd ~/Tele-osint
-
-# Create a proper requirements.txt
 cat > requirements.txt << 'EOF'
 python-telegram-bot==20.7
 pymongo==4.6.1
